@@ -73,13 +73,10 @@ async def process_message(message: str, dataset_ids: list[str] | None = None) ->
     # Step 4: Determine intent and execute
     intent = await _classify_intent(message, datasets)
 
-    if intent["type"] == "chart":
+    if intent.get("type") == "chart":
         return await _handle_chart(message, datasets, selected_ids)
-    elif intent["type"] == "analysis":
-        return await _handle_analysis(message, datasets, selected_ids, intent)
-    elif intent["type"] == "query":
-        return await _handle_query(message, datasets, selected_ids)
     else:
+        # Everything else goes to the powerful query engine
         return await _handle_query(message, datasets, selected_ids)
 
 
@@ -100,18 +97,25 @@ Given a user message and dataset info, classify the intent.
 
 Return ONLY valid JSON:
 {
-    "type": "chart" | "analysis" | "query",
-    "analysis_subtype": "summary" | "correlation" | "top_n" | "bottom_n" | "group_by" | "period_change" | null,
-    "analysis_params": { "column": "...", "n": 5, "group_column": "...", "agg_column": "...", "agg_func": "sum" } or null,
+    "type": "chart" | "query",
     "reason": "brief explanation"
 }
 
 Guidelines:
-- "chart" = user wants to SEE/VISUALIZE data (mentions chart, graph, plot, show, visualize, compare visually, trend, pie, bar, line, scatter, etc.)
-- "analysis" = user wants NUMBERS/STATS (summary, statistics, average, correlation, top 5, group by, percentage change, etc.)
-- "query" = user asks a QUESTION about the data (what was the highest X, which Y had, when did Z, how many, etc.)
+- "chart" = user wants to SEE/VISUALIZE data. They explicitly or implicitly want a visual output.
+  Keywords: chart, graph, plot, visualize, show me, trend line, pie, bar, line, scatter, histogram, 
+  heatmap, compare visually, draw, display, distribution chart, etc.
+  
+- "query" = EVERYTHING ELSE. Any question, analysis, calculation, listing, comparison, statistics,
+  aggregation, filtering, or data exploration. This handler is extremely powerful and can:
+  - List columns, show data shape, describe columns
+  - Calculate derived metrics (daily return, moving averages, ratios, etc.)
+  - Find top/bottom N, filter, sort, group by
+  - Answer any analytical question about the data
+  - Compute summary statistics, correlations
+  - Compare values, find patterns, identify outliers
 
-If ambiguous, prefer "query" — it's the most flexible."""
+If ambiguous, ALWAYS choose "query" — it can handle almost anything."""
 
     user_prompt = f"Datasets:\n{ds_text}\n\nUser message: \"{message}\""
 
