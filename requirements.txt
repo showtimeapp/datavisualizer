@@ -1,14 +1,28 @@
+# Web Framework
 fastapi==0.115.0
 uvicorn==0.30.0
-pandas==2.2.2
-openpyxl==3.1.5
-plotly==5.22.0
 python-multipart==0.0.9
-pydantic==2.8.0
-pydantic-settings==2.4.0
-httpx==0.27.0
+
+# Data
+pandas==2.2.2
+numpy==2.1.0
+pyarrow==17.0.0
+
+# File Parsing
+openpyxl==3.1.5
 beautifulsoup4==4.12.3
 lxml==5.2.2
+
+# Charts + PNG Export
+plotly==5.22.0
 kaleido==0.2.1
+
+# LLM Client
+httpx==0.27.0
+
+# Validation
+pydantic==2.8.0
+pydantic-settings==2.4.0
+
 fastparquet  
 pyarrow 

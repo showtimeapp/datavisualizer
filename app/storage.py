@@ -225,3 +225,4 @@ def _build_column_meta(df: pd.DataFrame) -> list[dict]:
             "sample_values": samples,
         })
     return columns
+

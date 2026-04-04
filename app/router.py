@@ -234,12 +234,13 @@ async def _execute_chart_plan(plan: dict, df: pd.DataFrame, source: str, dataset
             x = _fuzzy_match(x, all_cols)
         y = [(_fuzzy_match(c, all_cols) if c not in all_cols else c) for c in y]
 
-        plotly_json = build_chart(working_df, chart_type, x, y, color, title)
+        plotly_result = build_chart(working_df, chart_type, x, y, color, title)
 
         return {
             "intent": "chart",
             "message": plan.get("explanation", f"Here's your {chart_type} chart."),
-            "chart": plotly_json,
+            "chart": plotly_result.get("plotly_json"),
+            "chart_png": plotly_result.get("png_base64"),
             "chart_type": chart_type,
             "chart_config": {
                 "x": x, "y": y, "color": color, "title": title,

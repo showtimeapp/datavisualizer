@@ -112,7 +112,7 @@ def suggest_charts(df: pd.DataFrame) -> list[dict]:
 
 def build_chart(df: pd.DataFrame, chart_type: str, x: str, y: list[str],
                 color: str = None, title: str = None) -> dict:
-    """Build a Plotly chart and return its JSON spec."""
+    """Build a Plotly chart and return JSON spec + PNG base64."""
 
     builder = CHART_BUILDERS.get(chart_type)
     if not builder:
@@ -124,11 +124,24 @@ def build_chart(df: pd.DataFrame, chart_type: str, x: str, y: list[str],
     fig.update_layout(
         template="plotly_white",
         title=title or f"{chart_type.title()} Chart",
-        margin=dict(l=40, r=40, t=60, b=40),
+        margin=dict(l=60, r=40, t=60, b=60),
         font=dict(size=12),
     )
 
-    return json.loads(fig.to_json())
+    # Generate PNG as base64
+    import base64
+    try:
+        png_bytes = fig.to_image(format="png", width=1200, height=600, scale=2)
+        png_base64 = base64.b64encode(png_bytes).decode("utf-8")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"PNG export failed: {e}, returning JSON only")
+        png_base64 = None
+
+    return {
+        "plotly_json": json.loads(fig.to_json()),
+        "png_base64": png_base64,
+    }
 
 
 def _build_bar(df, x, y, color, title):
@@ -403,3 +416,4 @@ async def smart_chart(df: pd.DataFrame, prompt: str) -> tuple[dict, pd.DataFrame
     plotly_json = build_chart(filtered_df, chart_type, x, y, color, title)
 
     return plotly_json, config
+
