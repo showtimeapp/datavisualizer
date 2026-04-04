@@ -1,12 +1,13 @@
 """
-Financial Data Visualization Backend — Unified API
-====================================================
-3 endpoints:
-  POST /api/upload        — Upload one or more files
-  POST /api/chat          — Ask anything (chart, analysis, query) — LLM decides
-  GET  /api/datasets      — List uploaded datasets
+Financial Data Visualization Backend — Unified API v2.1
+========================================================
+  POST /api/upload         — Upload one or more files (permanent)
+  POST /api/text           — Send raw text (temporary, auto-expires)
+  POST /api/chat           — Ask anything — LLM routes to chart/query
+  GET  /api/datasets       — List all datasets (permanent + temp)
+  GET  /api/dataset/{id}   — Get dataset details + preview
   DELETE /api/dataset/{id} — Delete a dataset
-  GET  /api/playground/{id} — Interactive chart viewer (browser)
+  GET  /api/playground     — Interactive chart viewer (browser)
 """
 
 import traceback
@@ -25,13 +26,16 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from app.config import settings
 from app.models import (
     ChatRequest, ChatResponse, UploadResponse,
+    TextInputRequest, TextInputResponse,
     DatasetInfo, ColumnInfo, IntentType,
 )
-from app.ingestion import ingest_file
+from app.ingestion import ingest_file, ingest_raw_text
 from app.processing import process_dataframe
 from app.storage import (
-    save_dataset, load_dataset, load_metadata,
+    save_dataset, save_temp_dataset,
+    load_dataset, load_metadata,
     list_datasets, delete_dataset,
+    TEMP_TTL_SECONDS,
 )
 from app.router import process_message
 
@@ -72,7 +76,7 @@ app = FastAPI(
         "Upload financial data → ask questions, get charts, run analysis. "
         "One chat endpoint handles everything. LLM decides the intent."
     ),
-    version="2.0.0",
+    version="2.1.0",
     default_response_class=SafeJSONResponse,
 )
 
@@ -102,45 +106,43 @@ def safe_preview(df, n=5) -> list[dict]:
 async def root():
     return {
         "service": "Financial Data Visualization API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "llm_provider": settings.LLM_PROVIDER,
         "endpoints": {
-            "POST /api/upload": "Upload one or more files (multipart)",
-            "POST /api/chat": "Ask anything — LLM routes to chart/analysis/query",
-            "GET  /api/datasets": "List all uploaded datasets",
+            "POST /api/upload": "Upload files (permanent storage)",
+            "POST /api/text": "Send raw text (temporary, auto-expires in 30min)",
+            "POST /api/chat": "Ask anything — LLM routes to chart/query",
+            "GET  /api/datasets": "List all datasets",
             "GET  /api/dataset/{id}": "Get dataset details + preview",
             "DELETE /api/dataset/{id}": "Delete a dataset",
-            "GET  /api/playground/{id}": "Interactive chart viewer (open in browser)",
+            "GET  /api/playground": "Interactive chart viewer (browser)",
+            "GET  /api/playground/{id}": "Chart viewer for specific dataset",
         },
     }
 
 
 # ═══════════════════════════════════════════════════════════
-#  1. UPLOAD — supports multiple files at once
+#  1. UPLOAD — permanent storage, returns dataset_ids
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_files(files: List[UploadFile] = File(...)):
     """
-    Upload one or more files. Each file becomes a separate dataset.
+    Upload one or more files. Each becomes a permanent dataset.
+    Returns dataset_ids you can use with /api/chat.
     
-    Supported formats: CSV, Excel (.xlsx/.xls), HTML, Markdown, JSON, TXT
-    
-    Example (curl):
-        curl -X POST http://localhost:8000/api/upload \\
-          -F "files=@sales.csv" \\
-          -F "files=@expenses.xlsx" \\
-          -F "files=@report.html"
+    Supported: CSV, Excel (.xlsx/.xls), HTML, Markdown, JSON, TXT
     """
     results = []
     errors = []
+    dataset_ids = []
     max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
     for file in files:
         try:
             contents = await file.read()
             if len(contents) > max_bytes:
-                errors.append(f"{file.filename}: File too large (max {settings.MAX_UPLOAD_SIZE_MB}MB)")
+                errors.append(f"{file.filename}: Too large (max {settings.MAX_UPLOAD_SIZE_MB}MB)")
                 continue
 
             df = await ingest_file(contents, file.filename)
@@ -148,11 +150,13 @@ async def upload_files(files: List[UploadFile] = File(...)):
             dataset_id = save_dataset(df, file.filename)
             meta = load_metadata(dataset_id)
 
+            dataset_ids.append(dataset_id)
             results.append(DatasetInfo(
                 dataset_id=dataset_id,
                 filename=file.filename,
                 columns=[ColumnInfo(**c) for c in meta["columns"]],
                 row_count=meta["row_count"],
+                temporary=False,
                 preview=safe_preview(df, 5),
             ))
 
@@ -163,35 +167,113 @@ async def upload_files(files: List[UploadFile] = File(...)):
     if not results and errors:
         raise HTTPException(400, detail={"message": "All uploads failed", "errors": errors})
 
-    msg_parts = [f"Successfully uploaded {len(results)} file(s)."]
+    msg = f"Uploaded {len(results)} file(s)."
     if errors:
-        msg_parts.append(f"Failed: {'; '.join(errors)}")
+        msg += f" Failed: {'; '.join(errors)}"
 
     return UploadResponse(
+        dataset_ids=dataset_ids,
         datasets=results,
-        message=" ".join(msg_parts),
+        message=msg,
     )
 
 
 # ═══════════════════════════════════════════════════════════
-#  2. CHAT — the single smart endpoint
+#  2. TEXT INPUT — temporary, in-memory, auto-expires
+# ═══════════════════════════════════════════════════════════
+
+@app.post("/api/text", response_model=TextInputResponse)
+async def text_input(req: TextInputRequest):
+    """
+    Send raw text — system extracts structured data and stores it temporarily.
+    Data auto-deletes after 30 minutes of inactivity. Never saved to disk.
+    
+    Use the returned dataset_id with /api/chat to ask questions.
+    
+    Examples:
+        {"text": "Revenue was $4.2M in Q1, $3.8M in Q2, $5.1M in Q3"}
+        {"text": "AAPL open 150 close 155, GOOG open 2800 close 2850"}
+        {"text": "Month,Sales,Profit\\nJan,1000,200\\nFeb,1200,300"}
+    """
+    try:
+        # Try CSV-like parsing first (if text has commas/tabs/newlines in table format)
+        df = await _smart_text_parse(req.text)
+        df = process_dataframe(df)
+
+        dataset_id = save_temp_dataset(df, req.name, ttl=TEMP_TTL_SECONDS)
+        meta = load_metadata(dataset_id)
+
+        return TextInputResponse(
+            dataset_id=dataset_id,
+            temporary=True,
+            expires_in_seconds=TEMP_TTL_SECONDS,
+            columns=[ColumnInfo(**c) for c in meta["columns"]],
+            row_count=meta["row_count"],
+            preview=safe_preview(df, 5),
+            message=f"Data loaded temporarily (expires in {TEMP_TTL_SECONDS // 60} min). Use dataset_id '{dataset_id}' with /api/chat.",
+        )
+
+    except Exception as e:
+        logger.error(f"Text input failed: {traceback.format_exc()}")
+        raise HTTPException(400, f"Could not parse text: {str(e)}")
+
+
+async def _smart_text_parse(text: str) -> pd.DataFrame:
+    """Try to parse text as CSV/TSV first (cheap), fall back to LLM (expensive)."""
+    import io
+    lines = text.strip().split("\n")
+
+    # If it looks like CSV (has commas and multiple lines)
+    if len(lines) >= 2 and "," in lines[0]:
+        try:
+            df = pd.read_csv(io.StringIO(text))
+            if len(df.columns) >= 2 and len(df) >= 1:
+                return df
+        except Exception:
+            pass
+
+    # If it looks like TSV
+    if len(lines) >= 2 and "\t" in lines[0]:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep="\t")
+            if len(df.columns) >= 2 and len(df) >= 1:
+                return df
+        except Exception:
+            pass
+
+    # If it looks like a pipe-separated table
+    if len(lines) >= 2 and "|" in lines[0]:
+        try:
+            from app.ingestion import parse_markdown
+            df = parse_markdown(text.encode("utf-8"))
+            if len(df.columns) >= 2 and len(df) >= 1:
+                return df
+        except Exception:
+            pass
+
+    # Fall back to LLM extraction
+    return await ingest_raw_text(text)
+
+
+# ═══════════════════════════════════════════════════════════
+#  3. CHAT — the single smart endpoint
 # ═══════════════════════════════════════════════════════════
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
     Send any message — the system automatically decides whether to:
-    - Generate a chart (bar, line, pie, scatter, etc.)
-    - Run analysis (summary stats, correlation, top-N, etc.)
-    - Answer a question about the data
-    - Ask for clarification (which file to use)
+    - Generate a chart
+    - Answer a question
+    - Ask for clarification
 
+    Works with both permanent and temporary datasets.
+    
     Examples:
         {"message": "show me a bar chart of revenue by quarter"}
         {"message": "what was the highest revenue month?"}
-        {"message": "give me summary statistics"}
-        {"message": "compare revenue across both files", "dataset_ids": ["abc123", "def456"]}
-        {"message": "pie chart from sales.csv"}
+        {"message": "list all columns"}
+        {"message": "calculate daily return and show in a chart", "dataset_ids": ["tmp_abc123"]}
     """
     try:
         result = await process_message(req.message, req.dataset_ids)
@@ -214,12 +296,12 @@ async def chat(req: ChatRequest):
 
 
 # ═══════════════════════════════════════════════════════════
-#  3. DATASET MANAGEMENT
+#  4. DATASET MANAGEMENT
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/datasets")
 async def get_datasets():
-    """List all uploaded datasets."""
+    """List all datasets — both permanent and temporary."""
     return list_datasets()
 
 
@@ -237,44 +319,35 @@ async def get_dataset(dataset_id: str, rows: int = Query(default=10, le=100)):
 
 @app.delete("/api/dataset/{dataset_id}")
 async def remove_dataset(dataset_id: str):
-    """Delete a dataset."""
+    """Delete a dataset (permanent or temporary)."""
     if delete_dataset(dataset_id):
         return {"deleted": dataset_id}
     raise HTTPException(404, f"Dataset '{dataset_id}' not found")
 
 
 # ═══════════════════════════════════════════════════════════
-#  4. PLAYGROUND — Interactive Chart Viewer (Browser)
+#  5. PLAYGROUND — Interactive Chart Viewer (Browser)
 # ═══════════════════════════════════════════════════════════
 
 @app.get("/api/playground/{dataset_id}", response_class=HTMLResponse)
 async def playground(dataset_id: str):
-    """
-    Interactive chart playground — open in browser.
-    Type prompts, see charts rendered live.
-    
-    URL: http://localhost:8000/api/playground/{dataset_id}
-    """
+    """Interactive chart playground for a specific dataset."""
     try:
         meta = load_metadata(dataset_id)
-        load_dataset(dataset_id)  # validate it exists
+        load_dataset(dataset_id)
     except FileNotFoundError:
         raise HTTPException(404, f"Dataset '{dataset_id}' not found")
 
     columns = [c["name"] for c in meta["columns"]]
-
     return _build_playground_html(dataset_id, meta, columns)
 
 
 @app.get("/api/playground", response_class=HTMLResponse)
 async def playground_all():
-    """
-    Interactive playground for all datasets.
-    URL: http://localhost:8000/api/playground
-    """
+    """Interactive playground for all datasets."""
     all_datasets = list_datasets()
     if not all_datasets:
-        return HTMLResponse("<h1>No datasets uploaded yet</h1><p>Upload files first via POST /api/upload</p>")
+        return HTMLResponse("<h1>No datasets uploaded yet</h1><p>Upload files via POST /api/upload or send text via POST /api/text</p>")
     return _build_playground_html(None, None, None, all_datasets)
 
 
@@ -284,6 +357,8 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
     if dataset_id:
         title = f"Playground — {meta['filename']}"
         subtitle = f"{meta['filename']} — {meta['row_count']} rows"
+        temp_badge = ' <span style="background:#e0af68;color:#0f1117;padding:2px 6px;border-radius:4px;font-size:0.7rem">TEMP</span>' if meta.get("temporary") else ""
+        subtitle += temp_badge
         cols_html = " ".join(f'<span class="col-tag">{c}</span>' for c in columns)
         ds_selector = f'<input type="hidden" id="dsInput" value="{dataset_id}">'
         ds_info = f'<div class="columns-bar">Columns: {cols_html}</div>'
@@ -291,13 +366,13 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
         title = "Playground — All Datasets"
         subtitle = f"{len(all_datasets)} dataset(s) loaded"
         ds_options = "".join(
-            f'<option value="{d["dataset_id"]}">{d["filename"]} ({d["row_count"]} rows)</option>'
+            f'<option value="{d["dataset_id"]}">{d["filename"]} ({d["row_count"]} rows){" [TEMP]" if d.get("temporary") else ""}</option>'
             for d in all_datasets
         )
         ds_selector = f'''<div class="ds-selector">
             <label>Dataset:</label>
             <select id="dsInput" multiple>{ds_options}</select>
-            <small>Hold Ctrl/Cmd to select multiple datasets</small>
+            <small>Hold Ctrl/Cmd to select multiple</small>
         </div>'''
         ds_info = ""
 
@@ -325,9 +400,7 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
             border-radius: 6px; color: #fff; font-size: 0.9rem;
         }}
         .ds-selector small {{ color: #555; font-size: 0.75rem; }}
-        .columns-bar {{
-            margin-bottom: 16px; font-size: 0.8rem; color: #555;
-        }}
+        .columns-bar {{ margin-bottom: 16px; font-size: 0.8rem; color: #555; }}
         .col-tag {{
             background: #1a1b26; padding: 3px 8px; border-radius: 4px;
             margin: 2px; display: inline-block; color: #7aa2f7;
@@ -363,17 +436,16 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
         }}
         .response-box.visible {{ display: block; }}
         .response-box .label {{ color: #7aa2f7; font-weight: 600; margin-bottom: 6px; }}
-        .response-box .answer {{ color: #ccc; }}
+        .response-box .answer {{ color: #ccc; white-space: pre-wrap; }}
         .response-box pre {{
             background: #0f1117; padding: 12px; border-radius: 6px; overflow-x: auto;
-            font-size: 0.8rem; color: #9ece6a; margin-top: 8px;
+            font-size: 0.8rem; color: #9ece6a; margin-top: 8px; max-height: 400px;
         }}
         .intent-badge {{
             display: inline-block; padding: 2px 8px; border-radius: 4px;
             font-size: 0.75rem; font-weight: 600; margin-left: 8px;
         }}
         .intent-chart {{ background: #2d4f67; color: #7dcfff; }}
-        .intent-analysis {{ background: #3b4261; color: #bb9af7; }}
         .intent-query {{ background: #2d3a27; color: #9ece6a; }}
         .intent-clarify {{ background: #4a3524; color: #e0af68; }}
         .clarify-btn {{
@@ -405,12 +477,12 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
             <p>Ask me anything about your data</p>
             <div class="examples">
                 <span onclick="fill(this.textContent)">show me a bar chart</span>
+                <span onclick="fill(this.textContent)">list all columns</span>
                 <span onclick="fill(this.textContent)">summary statistics</span>
                 <span onclick="fill(this.textContent)">what was the highest value?</span>
                 <span onclick="fill(this.textContent)">line graph of trends</span>
-                <span onclick="fill(this.textContent)">compare all columns</span>
+                <span onclick="fill(this.textContent)">top 5 rows</span>
                 <span onclick="fill(this.textContent)">pie chart breakdown</span>
-                <span onclick="fill(this.textContent)">top 5 rows by revenue</span>
                 <span onclick="fill(this.textContent)">correlation heatmap</span>
             </div>
         </div>
@@ -437,7 +509,6 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
 
         const btn = document.getElementById('btn');
         const status = document.getElementById('status');
-        const responseBox = document.getElementById('response');
 
         btn.disabled = true;
         btn.textContent = 'Thinking...';
@@ -459,8 +530,7 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
                 throw new Error(err.detail || 'Request failed');
             }}
 
-            const data = await resp.json();
-            handleResponse(data);
+            handleResponse(await resp.json());
 
         }} catch (err) {{
             status.textContent = err.message;
@@ -479,7 +549,6 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
         let html = `<div class="label">${{data.intent.toUpperCase()}} <span class="intent-badge ${{badgeClass}}">${{data.intent}}</span></div>`;
         html += `<div class="answer">${{data.message}}</div>`;
 
-        // Handle chart
         if (data.intent === 'chart' && data.chart) {{
             const ph = document.getElementById('placeholder');
             if (ph) ph.remove();
@@ -500,21 +569,14 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
             status.textContent = 'Chart generated';
         }}
 
-        // Handle analysis
-        if (data.intent === 'analysis' && data.analysis) {{
-            html += `<pre>${{JSON.stringify(data.analysis, null, 2)}}</pre>`;
-        }}
-
-        // Handle query
         if (data.intent === 'query' && data.data) {{
             html += `<pre>${{JSON.stringify(data.data, null, 2)}}</pre>`;
         }}
 
-        // Handle clarification
         if (data.intent === 'clarify' && data.options) {{
             html += '<div style="margin-top:10px">';
             data.options.forEach(opt => {{
-                html += `<span class="clarify-btn" onclick="selectDataset('${{opt.dataset_id}}', '${{opt.filename}}')">${{opt.filename}}</span>`;
+                html += `<span class="clarify-btn" onclick="selectDataset('${{opt.dataset_id}}')">${{opt.filename}}</span>`;
             }});
             html += '</div>';
             status.style.color = '#e0af68';
@@ -525,7 +587,7 @@ def _build_playground_html(dataset_id, meta, columns, all_datasets=None):
         responseBox.classList.add('visible');
     }}
 
-    function selectDataset(id, name) {{
+    function selectDataset(id) {{
         const el = document.getElementById('dsInput');
         if (el.tagName === 'SELECT') {{
             Array.from(el.options).forEach(o => o.selected = o.value === id);

@@ -21,11 +21,39 @@ class DatasetInfo(BaseModel):
     filename: str
     columns: list[ColumnInfo]
     row_count: int
+    temporary: bool = False
     preview: list[dict[str, Any]] = []
 
 
 class UploadResponse(BaseModel):
-    datasets: list[DatasetInfo]
+    dataset_ids: list[str]              # Quick access to IDs
+    datasets: list[DatasetInfo]         # Full details
+    message: str
+
+
+# ─── Text Input (temporary session) ──────────────────────
+
+class TextInputRequest(BaseModel):
+    """Send raw text — system extracts data, stores temporarily (auto-deletes)."""
+    text: str = Field(
+        ...,
+        description="Raw text containing data — can be CSV-like, sentences with numbers, or any format",
+        examples=[
+            "Revenue was $4.2M in Q1, $3.8M in Q2, and $5.1M in Q3",
+            "AAPL,150.2,155.3,149.0,154.8\nGOOG,2800,2850,2790,2840",
+            "Company A profit 12%, Company B profit 8%, Company C profit 15%",
+        ],
+    )
+    name: str = Field(default="text_input", description="Optional label for this data")
+
+
+class TextInputResponse(BaseModel):
+    dataset_id: str
+    temporary: bool = True
+    expires_in_seconds: int
+    columns: list[ColumnInfo]
+    row_count: int
+    preview: list[dict[str, Any]] = []
     message: str
 
 
@@ -51,21 +79,21 @@ class ChatRequest(BaseModel):
 
 
 class IntentType(str, Enum):
-    chart = "chart"           # User wants a visualization
-    analysis = "analysis"     # User wants stats/aggregation/comparison
-    query = "query"           # User wants to ask a question about the data
-    clarify = "clarify"       # System needs to ask the user something
+    chart = "chart"
+    analysis = "analysis"
+    query = "query"
+    clarify = "clarify"
 
 
 class ChatResponse(BaseModel):
     """Unified response — can contain a chart, analysis, answer, or a clarification question."""
     intent: IntentType
-    message: str                             # Human-readable answer/explanation
+    message: str
 
     # Chart output (only when intent = "chart")
-    chart: Optional[dict[str, Any]] = None   # Full Plotly JSON spec
+    chart: Optional[dict[str, Any]] = None
     chart_type: Optional[str] = None
-    chart_config: Optional[dict] = None      # What the LLM interpreted
+    chart_config: Optional[dict] = None
 
     # Analysis output (only when intent = "analysis")
     analysis: Optional[dict[str, Any]] = None
@@ -74,7 +102,7 @@ class ChatResponse(BaseModel):
     data: Optional[Any] = None
 
     # Clarification (only when intent = "clarify")
-    options: Optional[list[dict]] = None     # [{dataset_id, filename, reason}]
+    options: Optional[list[dict]] = None
 
     # Always present
     datasets_used: list[str] = []
